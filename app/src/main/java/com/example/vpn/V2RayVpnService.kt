@@ -9,44 +9,71 @@ import android.content.Intent
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.data.db.AppDatabase
 import com.example.data.model.PerAppMode
 import com.example.data.model.ProtocolType
 import com.example.data.model.RoutingMode
-import com.example.data.model.RoutingSettings
 import com.example.data.model.ServerConfig
-import com.example.data.model.VpnState
-import com.example.data.parser.XrayConfigGenerator
 import com.example.data.repository.SettingsRepository
 import com.example.data.repository.TrafficRepository
+import go.Seq
+import hev.htproxy.TProxyService
+import libv2ray.CoreCallbackHandler
+import libv2ray.CoreController
+import libv2ray.Libv2ray
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import kotlin.random.Random
+import java.io.File
+import java.util.UUID
 
 class V2RayVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var serviceJob: Job? = null
     private val serviceScope = CoroutineScope(Dispatchers.IO)
-
+    private var xray: CoreController? = null
     private var currentServer: ServerConfig? = null
     private var sessionStartTime: Long = 0L
     private var totalUpload: Long = 0L
     private var totalDownload: Long = 0L
 
+    private val coreCallback = object : CoreCallbackHandler {
+        override fun startup(): Int {
+            Log.i(TAG, "Xray core started")
+            return 0
+        }
+
+        override fun shutdown(): Int {
+            Log.i(TAG, "Xray core stopped")
+            return 0
+        }
+
+        override fun onEmitStatus(code: Int, message: String): Int {
+            Log.i(TAG, "Xray[$code]: $message")
+            if (code != 0) {
+                VpnManager.setError(message)
+            }
+            return 0
+        }
+    }
+
     companion object {
+        private const val TAG = "LightSpeedVPN"
         const val ACTION_START = "com.example.vpn.START"
         const val ACTION_STOP = "com.example.vpn.STOP"
         const val CHANNEL_ID = "v2ray_vpn_channel"
         const val NOTIFICATION_ID = 1001
+        private const val MTU = 1500
+        private const val IPV4_ADDRESS = "172.19.0.1"
+        private const val IPV6_ADDRESS = "fd00:1:2::1"
+        private const val SOCKS_PORT = 10808
 
         fun start(context: Context, server: ServerConfig) {
             val intent = Intent(context, V2RayVpnService::class.java).apply {
@@ -56,6 +83,18 @@ class V2RayVpnService : VpnService() {
                 putExtra("server_address", server.address)
                 putExtra("server_port", server.port)
                 putExtra("server_protocol", server.protocol.name)
+                putExtra("server_uuid", server.uuidOrPassword)
+                putExtra("server_security", server.security)
+                putExtra("server_network", server.networkType)
+                putExtra("server_tls", server.tls)
+                putExtra("server_sni", server.sni)
+                putExtra("server_host", server.host)
+                putExtra("server_path", server.path)
+                putExtra("server_alpn", server.alpn)
+                putExtra("server_flow", server.flow)
+                putExtra("server_public_key", server.publicKey)
+                putExtra("server_short_id", server.shortId)
+                putExtra("server_alter_id", server.alterId)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -75,161 +114,180 @@ class V2RayVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        try {
+            Seq.setContext(applicationContext)
+            Libv2ray.initCoreEnv(filesDir.absolutePath, UUID.randomUUID().toString())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize Xray native environment", e)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
-                val serverId = intent.getLongExtra("server_id", 0L)
-                val serverName = intent.getStringExtra("server_name") ?: "V2Ray Server"
-                val serverAddress = intent.getStringExtra("server_address") ?: "127.0.0.1"
-                val serverPort = intent.getIntExtra("server_port", 443)
-                val protocolName = intent.getStringExtra("server_protocol") ?: "VMESS"
-                val protocol = try { ProtocolType.valueOf(protocolName) } catch (_: Exception) { ProtocolType.VMESS }
-
                 val server = ServerConfig(
-                    id = serverId,
-                    name = serverName,
-                    protocol = protocol,
-                    address = serverAddress,
-                    port = serverPort,
-                    uuidOrPassword = ""
+                    id = intent.getLongExtra("server_id", 0L),
+                    name = intent.getStringExtra("server_name") ?: "V2Ray Server",
+                    protocol = runCatching {
+                        ProtocolType.valueOf(intent.getStringExtra("server_protocol") ?: "VMESS")
+                    }.getOrDefault(ProtocolType.VMESS),
+                    address = intent.getStringExtra("server_address") ?: "127.0.0.1",
+                    port = intent.getIntExtra("server_port", 443),
+                    uuidOrPassword = intent.getStringExtra("server_uuid") ?: "",
+                    security = intent.getStringExtra("server_security") ?: "",
+                    networkType = intent.getStringExtra("server_network") ?: "tcp",
+                    tls = intent.getStringExtra("server_tls") ?: "none",
+                    sni = intent.getStringExtra("server_sni") ?: "",
+                    host = intent.getStringExtra("server_host") ?: "",
+                    path = intent.getStringExtra("server_path") ?: "/",
+                    alpn = intent.getStringExtra("server_alpn") ?: "",
+                    flow = intent.getStringExtra("server_flow") ?: "",
+                    publicKey = intent.getStringExtra("server_public_key") ?: "",
+                    shortId = intent.getStringExtra("server_short_id") ?: "",
+                    alterId = intent.getIntExtra("server_alter_id", 0)
                 )
                 startVpn(server)
             }
-            ACTION_STOP -> {
-                stopVpn()
-            }
+            ACTION_STOP -> stopVpn()
         }
         return START_NOT_STICKY
     }
 
     private fun startVpn(server: ServerConfig) {
+        if (serviceJob?.isActive == true) return
+
         currentServer = server
         VpnManager.setConnecting(server)
-        startForeground(NOTIFICATION_ID, buildNotification(server.name, "Connecting to ${server.name}..."))
+        startForeground(NOTIFICATION_ID, buildNotification(server.name, "Connecting…"))
 
-        serviceJob?.cancel()
         serviceJob = serviceScope.launch {
             try {
-                val settingsRepo = SettingsRepository(applicationContext)
-                val settings = settingsRepo.settings.value
+                val settings = SettingsRepository(applicationContext).settings.value
 
-                // Generate full Xray config
-                val xrayConfigJson = XrayConfigGenerator.generateConfig(server, settings)
-
-                // Configure Android VPN Interface
+                // The VPN app itself is excluded in global/bypass modes so Xray's
+                // upstream sockets cannot be captured by the VPN and loop back.
                 val builder = Builder()
                     .setSession(server.name)
-                    .setMtu(1500)
-                    .addAddress("172.19.0.1", 30)
+                    .setMtu(MTU)
+                    .addAddress(IPV4_ADDRESS, 30)
+                    .addAddress(IPV6_ADDRESS, 126)
                     .addRoute("0.0.0.0", 0)
+                    .addRoute("::", 0)
+                    .addDnsServer(settings.dnsServer.ifBlank { "1.1.1.1" })
 
-                // DNS
-                val dns = settings.dnsServer.ifBlank { "1.1.1.1" }
-                try {
-                    builder.addDnsServer(dns)
-                } catch (_: Exception) {
-                    builder.addDnsServer("1.1.1.1")
-                }
-
-                // Split tunneling / Per-App routing
-                if (settings.mode == RoutingMode.PER_APP && settings.selectedPackages.isNotEmpty()) {
-                    for (pkg in settings.selectedPackages) {
-                        try {
-                            if (settings.perAppMode == PerAppMode.ALLOW_SELECTED) {
-                                builder.addAllowedApplication(pkg)
-                            } else {
-                                builder.addDisallowedApplication(pkg)
-                            }
-                        } catch (_: Exception) {
-                            // package might not be installed
+                if (settings.mode == RoutingMode.PER_APP) {
+                    if (settings.perAppMode == PerAppMode.ALLOW_SELECTED) {
+                        for (pkg in settings.selectedPackages) {
+                            if (pkg == packageName) continue
+                            runCatching { builder.addAllowedApplication(pkg) }
+                        }
+                    } else {
+                        runCatching { builder.addDisallowedApplication(packageName) }
+                        for (pkg in settings.selectedPackages) {
+                            runCatching { builder.addDisallowedApplication(pkg) }
                         }
                     }
+                } else {
+                    // Global/BYPASS_LAN: all apps go through the VPN except this
+                    // process, which owns the Xray upstream connection.
+                    runCatching { builder.addDisallowedApplication(packageName) }
                 }
 
-                // Establish VPN descriptor
                 val pfd = builder.establish()
-                if (pfd == null) {
-                    VpnManager.setError("Failed to establish VPN interface. Permission might be revoked.")
-                    stopVpn()
-                    return@launch
-                }
+                    ?: throw IllegalStateException("Failed to establish Android TUN interface")
                 vpnInterface = pfd
+
+                // Xray is the real proxy engine. It exposes a local SOCKS5 endpoint.
+                val config = com.example.data.parser.XrayConfigGenerator.generateConfig(
+                    server = server,
+                    settings = settings,
+                    localSocksPort = SOCKS_PORT
+                )
+                val controller = Libv2ray.newCoreController(coreCallback)
+                xray = controller
+                controller.startLoop(config, pfd.fd)
+
+                // Android's VpnService fd is bridged to Xray's local SOCKS5 by
+                // hev-socks5-tunnel. This is the missing packet-forwarding layer
+                // that the old implementation replaced with fake traffic numbers.
+                val tunnelConfig = buildTunnelConfig()
+                val configFile = File(cacheDir, "hev-tunnel.yml")
+                configFile.writeText(tunnelConfig)
+                if (!TProxyService.TProxyStartService(configFile.absolutePath, pfd.fd)) {
+                    throw IllegalStateException("hev-socks5-tunnel failed to start")
+                }
 
                 sessionStartTime = System.currentTimeMillis()
                 totalUpload = 0L
                 totalDownload = 0L
                 VpnManager.setConnected(server, sessionStartTime)
 
-                // Update notification
                 val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 notificationManager.notify(NOTIFICATION_ID, buildNotification(server.name, "Connected • Protected"))
 
-                // Run traffic loop: reads from tun interface and monitors throughput
-                runTrafficLoop(pfd)
+                runTrafficMonitor()
             } catch (e: Exception) {
-                VpnManager.setError(e.localizedMessage ?: "VPN Connection error")
-                stopVpn()
+                Log.e(TAG, "VPN start failed", e)
+                VpnManager.setError(e.localizedMessage ?: "VPN connection error")
+                cleanupTunnel()
             }
         }
     }
 
-    private suspend fun runTrafficLoop(pfd: ParcelFileDescriptor) {
-        val inStream = FileInputStream(pfd.fileDescriptor)
-        val outStream = FileOutputStream(pfd.fileDescriptor)
-        val buffer = ByteArray(32768)
+    private fun buildTunnelConfig(): String = """
+        tunnel:
+          name: tun0
+          mtu: $MTU
+          multi-queue: false
+          ipv4: $IPV4_ADDRESS
+          ipv6: '$IPV6_ADDRESS'
+          icmp: 'reply'
+        socks5:
+          address: 127.0.0.1
+          port: $SOCKS_PORT
+          udp: 'udp'
+        misc:
+          log-level: warn
+    """.trimIndent()
 
-        var lastTick = System.currentTimeMillis()
-        var bytesUpInInterval = 0L
-        var bytesDownInInterval = 0L
-
-        while (serviceScope.isActive && vpnInterface != null) {
+    private suspend fun runTrafficMonitor() {
+        while (serviceScope.isActive && vpnInterface != null && TProxyService.TProxyIsRunning()) {
             delay(1000)
-            val now = System.currentTimeMillis()
-            val durationSeconds = (now - sessionStartTime) / 1000
-
-            // Generate realistic throughput telemetry for active tunnel
-            val activeSimulation = Random.nextBoolean()
-            val simulatedDown = if (activeSimulation) (Random.nextInt(15_000, 180_000)).toLong() else 2048L
-            val simulatedUp = if (activeSimulation) (Random.nextInt(5_000, 45_000)).toLong() else 1024L
-
-            bytesDownInInterval = simulatedDown
-            bytesUpInInterval = simulatedUp
-
-            totalDownload += bytesDownInInterval
-            totalUpload += bytesUpInInterval
-
-            VpnManager.updateTraffic(
-                durationSeconds = durationSeconds,
-                uploadSpeedBps = bytesUpInInterval,
-                downloadSpeedBps = bytesDownInInterval,
-                totalUploadBytes = totalUpload,
-                totalDownloadBytes = totalDownload
-            )
-
-            // Update ongoing notification periodically
-            if (durationSeconds % 5 == 0L) {
-                val formattedDown = formatSpeed(bytesDownInInterval)
-                val formattedUp = formatSpeed(bytesUpInInterval)
-                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                notificationManager.notify(
-                    NOTIFICATION_ID,
-                    buildNotification(
-                        currentServer?.name ?: "V2Ray",
-                        "Connected: ${formatDuration(durationSeconds)} | ↓ $formattedDown  ↑ $formattedUp"
-                    )
+            val stats = runCatching { TProxyService.TProxyGetStats() }.getOrNull()
+            if (stats != null && stats.size >= 4) {
+                // hev stats: txPackets, txBytes, rxPackets, rxBytes.
+                val up = stats[1].coerceAtLeast(0L)
+                val down = stats[3].coerceAtLeast(0L)
+                totalUpload = up
+                totalDownload = down
+                val duration = (System.currentTimeMillis() - sessionStartTime) / 1000
+                VpnManager.updateTraffic(
+                    durationSeconds = duration,
+                    uploadSpeedBps = up,
+                    downloadSpeedBps = down,
+                    totalUploadBytes = totalUpload,
+                    totalDownloadBytes = totalDownload
                 )
             }
         }
     }
 
+    private fun cleanupTunnel() {
+        try { TProxyService.TProxyStopService() } catch (_: Exception) { }
+        try { xray?.stopLoop() } catch (_: Exception) { }
+        xray = null
+        try { vpnInterface?.close() } catch (_: Exception) { }
+        vpnInterface = null
+    }
+
     private fun stopVpn() {
         VpnManager.setStopping()
         serviceJob?.cancel()
+        serviceJob = null
 
-        // Persist session traffic to Room DB
-        val duration = if (sessionStartTime > 0) (System.currentTimeMillis() - sessionStartTime) / 1000 else 0L
+        val duration = if (sessionStartTime > 0) {
+            (System.currentTimeMillis() - sessionStartTime) / 1000
+        } else 0L
         if (duration > 0 || totalDownload > 0 || totalUpload > 0) {
             val server = currentServer
             val db = AppDatabase.getDatabase(applicationContext)
@@ -245,12 +303,7 @@ class V2RayVpnService : VpnService() {
             }
         }
 
-        try {
-            vpnInterface?.close()
-        } catch (_: Exception) {
-        }
-        vpnInterface = null
-
+        cleanupTunnel()
         VpnManager.setDisconnected()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -276,8 +329,7 @@ class V2RayVpnService : VpnService() {
                 description = "Shows current VPN connection status and traffic"
                 setShowBadge(false)
             }
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
         }
     }
 
@@ -289,15 +341,11 @@ class V2RayVpnService : VpnService() {
             this, 0, launchIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
-        val stopIntent = Intent(this, V2RayVpnService::class.java).apply {
-            action = ACTION_STOP
-        }
+        val stopIntent = Intent(this, V2RayVpnService::class.java).apply { action = ACTION_STOP }
         val stopPendingIntent = PendingIntent.getService(
             this, 1, stopIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(content)
@@ -306,20 +354,5 @@ class V2RayVpnService : VpnService() {
             .setOngoing(true)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPendingIntent)
             .build()
-    }
-
-    private fun formatSpeed(bytesPerSec: Long): String {
-        return when {
-            bytesPerSec >= 1024 * 1024 -> String.format("%.1f MB/s", bytesPerSec / (1024f * 1024f))
-            bytesPerSec >= 1024 -> String.format("%.1f KB/s", bytesPerSec / 1024f)
-            else -> "$bytesPerSec B/s"
-        }
-    }
-
-    private fun formatDuration(seconds: Long): String {
-        val h = seconds / 3600
-        val m = (seconds % 3600) / 60
-        val s = seconds % 60
-        return if (h > 0) String.format("%02d:%02d:%02d", h, m, s) else String.format("%02d:%02d", m, s)
     }
 }
