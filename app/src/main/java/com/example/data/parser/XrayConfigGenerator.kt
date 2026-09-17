@@ -27,7 +27,6 @@ object XrayConfigGenerator {
             put("loglevel", "warning")
         })
 
-        // Enable outbound traffic counters for the UI.
         root.put("stats", JSONObject())
         root.put("policy", JSONObject().apply {
             put("levels", JSONObject())
@@ -133,6 +132,9 @@ object XrayConfigGenerator {
                     server.tls.equals("reality", ignoreCase = true) -> {
                         put("security", "reality")
                         put("realitySettings", JSONObject().apply {
+                            // Reality needs a uTLS fingerprint. Chrome is the common
+                            // interoperable default when the URI does not carry fp=.
+                            put("fingerprint", "chrome")
                             put("serverName", if (server.sni.isNotBlank()) server.sni else server.host)
                             put("publicKey", server.publicKey)
                             put("shortId", server.shortId)
@@ -198,7 +200,6 @@ object XrayConfigGenerator {
             put("rules", routingRules)
         })
 
-        // DNS is resolved by Xray and requests are sent through its routing engine.
         root.put("dns", JSONObject().apply {
             put("servers", JSONArray(listOf(settings.dnsServer.ifBlank { "1.1.1.1" }, "8.8.8.8")))
         })
