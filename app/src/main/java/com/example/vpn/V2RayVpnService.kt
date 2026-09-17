@@ -173,6 +173,8 @@ class V2RayVpnService : VpnService() {
                         for (pkg in settings.selectedPackages) runCatching { builder.addDisallowedApplication(pkg) }
                     }
                 } else {
+                    // The VPN app itself must stay outside the VPN. This prevents the Xray
+                    // upstream connection from being routed back into our own TUN.
                     runCatching { builder.addDisallowedApplication(packageName) }
                 }
 
@@ -182,7 +184,13 @@ class V2RayVpnService : VpnService() {
                 val config = com.example.data.parser.XrayConfigGenerator.generateConfig(server, settings, SOCKS_PORT)
                 val controller = Libv2ray.newCoreController(coreCallback)
                 xray = controller
-                controller.startLoop(config, pfd.fd)
+
+                // Hev owns the Android TUN in this architecture. Xray only exposes the
+                // local SOCKS/HTTP inbounds and makes the upstream proxy connection.
+                // Passing the Android TUN fd to Xray as well would make two native components
+                // compete for the same TUN. v2rayNG explicitly uses fd=0 when Hev tun2socks
+                // is enabled for the same reason.
+                controller.startLoop(config, 0)
 
                 val tunnelConfig = buildTunnelConfig()
                 val configFile = File(cacheDir, "hev-tunnel.yml")
