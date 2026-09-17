@@ -4,7 +4,6 @@ import android.app.Application
 import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.data.SampleData
 import com.example.data.db.AppDatabase
 import com.example.data.model.RoutingSettings
 import com.example.data.model.ServerConfig
@@ -72,21 +71,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val statusMessage: StateFlow<String?> = _statusMessage.asStateFlow()
 
     init {
-        // Seed default sample data if database is empty and ensure user's subscription is present
+        // Do not seed demo servers. The server list is populated only from
+        // subscriptions or explicit user imports.
         viewModelScope.launch(Dispatchers.IO) {
-            val userSubUrl = "https://orginal.iranlightspeed.xyz:2096/sub/w63xmya59lum3y8n"
+            // Clean up the old demo entries that shipped in earlier builds.
+            // Only the known demo xraynode.net entries are removed; user
+            // subscription/manual servers are left untouched.
             val existingServers = db.serverDao().getAllServers().first()
-            val existingSubs = db.subscriptionDao().getAllSubscriptions().first()
-
-            if (existingServers.isEmpty()) {
-                for (sub in SampleData.defaultSubscriptions) {
-                    db.subscriptionDao().insertSubscription(sub)
-                }
-                serverRepo.insertServers(SampleData.defaultServers)
-            } else if (existingSubs.none { it.url == userSubUrl }) {
-                // Subscription is not yet added, add and fetch immediately
-                subscriptionRepo.addSubscription("Iran LightSpeed 🇹🇷", userSubUrl, 6)
-            }
+            existingServers
+                .filter { it.address.contains("xraynode.net", ignoreCase = true) || it.rawUri.contains("xraynode.net", ignoreCase = true) }
+                .forEach { serverRepo.deleteServerById(it.id) }
         }
     }
 
@@ -107,7 +101,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val server = V2RayParser.parseUri(uri.trim())
         return if (server != null) {
             viewModelScope.launch(Dispatchers.IO) {
-                val id = serverRepo.insertServer(server)
+                serverRepo.insertServer(server)
                 _statusMessage.value = "Imported: ${server.name}"
             }
             true
@@ -156,7 +150,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             val results = jobs.awaitAll()
 
-            // If auto select lowest ping is enabled, pick the best ping server
             if (settings.value.autoSelectLowestPing) {
                 val validPings = results.filter { it.second > 0 }.sortedBy { it.second }
                 val best = validPings.firstOrNull()?.first
